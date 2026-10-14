@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airport raw weather</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #f3f5f7; --surface: #ffffff; --ink: #14202b; --muted: #5d6b78;
+    --line: #d5dce3; --accent: #0b6e99; --accent-ink: #ffffff; --err: #b3261e;
+    --code-bg: #eaeff3;
+    --vfr: #1e7a3c; --mvfr: #1b5fb8; --ifr: #b3261e; --lifr: #8a2fa8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10181f; --surface: #17222b; --ink: #e6edf3; --muted: #93a1ad;
+      --line: #2a3945; --accent: #4cb4e0; --accent-ink: #08212d; --err: #ff8a80;
+      --code-bg: #0d151b;
+      --vfr: #5fd08a; --mvfr: #6aa8ff; --ifr: #ff8a80; --lifr: #d79bf0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  p.sub { margin: 0 0 24px; color: var(--muted); }
+  form { display: flex; gap: 8px; }
+  input {
+    flex: 1; min-width: 0; padding: 12px 14px; font: inherit; font-size: 1.1rem;
+    letter-spacing: .08em; text-transform: uppercase;
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  button {
+    padding: 12px 20px; font: inherit; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 8px;
+  }
+  button:disabled { opacity: .6; cursor: wait; }
+  input:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  #status { margin: 16px 0 0; min-height: 1.5em; color: var(--muted); }
+  #status.error { color: var(--err); }
+  .card {
+    margin-top: 16px; padding: 16px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .card > h2 { font-size: 1.1rem; margin: 0 0 10px; }
+  .map { height: 220px; border-radius: 6px; border: 1px solid var(--line); margin-bottom: 4px; z-index: 0; }
+  .part { margin-top: 16px; }
+  .part h3 { font-size: .95rem; margin: 0 0 6px; }
+  .part .time { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .empty { margin: 0; color: var(--muted); }
+  .note { margin: 4px 0 8px; color: var(--muted); font-size: .9rem; }
+  pre {
+    margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap;
+    word-break: break-word; background: var(--code-bg); border-radius: 6px;
+    font: .95rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  dl.decoded {
+    display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px;
+    margin: 10px 0 0; font-size: .95rem;
+  }
+  dl.decoded dt { color: var(--muted); }
+  dl.decoded dd { margin: 0; }
+  .chip { font-weight: 700; }
+  .chip.VFR { color: var(--vfr); } .chip.MVFR { color: var(--mvfr); }
+  .chip.IFR { color: var(--ifr); } .chip.LIFR { color: var(--lifr); }
+  .period { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .period h4 { font-size: .9rem; margin: 0; }
+  .period dl.decoded { margin-top: 6px; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); }
+  details pre { margin-top: 8px; }
+  @media (max-width: 480px) {
+    dl.decoded { grid-template-columns: 1fr; gap: 0; }
+    dl.decoded dd { margin-bottom: 6px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Airport raw weather</h1>
+  <p class="sub">Enter an ICAO airport code (for example KJFK, EGLL, ZBAA) to get its METAR and TAF, a plain-English decode, and a map. Separate several codes with commas. If a small airport has no METAR, the page shows the nearest reporting station and a model estimate for the airport instead.</p>
+
+  <form id="form">
+    <input id="code" type="text" placeholder="KJFK" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Airport ICAO code" required>
+    <button id="go" type="submit">Get weather</button>
+  </form>
+
+  <p id="status" role="status" aria-live="polite"></p>
+  <div id="results"></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+  const BASE = "https://aviationweather.gov/api/data/";
+  const form = document.getElementById("form");
+  const input = document.getElementById("code");
+  const btn = document.getElementById("go");
+  const statusEl = document.getElementById("status");
+  const results = document.getElementById("results");
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg;
+    statusEl.className = isError ? "error" : "";
+  }
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = text;
+    return n;
+  }
+
+  /* ---------- fetching ---------- */
+
+  async function load(product, ids) {
+    const url = BASE + product + "?ids=" + encodeURIComponent(ids) + "&format=json";
+    const res = await fetch(url);
+    if (res.status === 204) return [];
+    if (!res.ok) throw new Error(product.toUpperCase() + ": server returned " + res.status);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  }
+
+  /* ---------- decoding helpers ---------- */
+
+  const pad = function (n) { return String(n).padStart(2, "0"); };
+  const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+  function fmtTime(v) {
+    if (v === undefined || v === null || v === "") return null;
+    let d;
+    if (typeof v === "number") d = new Date(v * 1000);
+    else d = new Date(String(v).replace(" ", "T") + (/[zZ]|[+-]\d\d:?\d\d$/.test(v) ? "" : "Z"));
+    if (isNaN(d)) return String(v);
+    return d.getUTCDate() + " " + MONTHS[d.getUTCMonth()] + " " + pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + " UTC";
+  }
+
+  function compass(deg) {
+    const pts = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+    return pts[Math.round(deg / 22.5) % 16];
+  }
+
+  function wind(o) {
+    if (o.wspd === undefined || o.wspd === null) return null;
+    const kmh = function (kt) { return Math.round(kt * 1.852); };
+    if (Number(o.wspd) === 0) return "Calm";
+    let s;
+    if (o.wdir === "VRB" || o.wdir === undefined || o.wdir === null) s = "Variable direction";
+    else s = "From " + o.wdir + "° (" + compass(Number(o.wdir)) + ")";
+    s += " at " + o.wspd + " kt (" + kmh(o.wspd) + " km/h)";
+    if (o.wgst) s += ", gusting " + o.wgst + " kt (" + kmh(o.wgst) + " km/h)";
+    return s;
+  }
+
+  function visibility(v) {
+    if (v === undefined || v === null || v === "") return null;
+    const plus = String(v).indexOf("+") !== -1;
+    const n = parseFloat(v);
+    if (isNaN(n)) return String(v);
+    const km = (n * 1.609).toFixed(n >= 10 ? 0 : 1);
+    return (plus ? n + " SM or more" : n + " SM") + " (" + km + (plus ? "+" : "") + " km)";
+  }
+
+  const COVER = {
+    SKC: "Sky clear", CLR: "Clear", NSC: "No significant cloud", NCD: "No cloud detected",
+    FEW: "Few", SCT: "Scattered", BKN: "Broken", OVC: "Overcast",
+    OVX: "Sky obscured (vertical visibility)", CAVOK: "Ceiling and visibility OK"
+  };
+
+  function clouds(list) {
+    if (!Array.isArray(list) || !list.length) return null;
+    return list.map(function (c) {
+      let s = COVER[c.cover] || c.cover || "?";
+      if (c.base !== undefined && c.base !== null) s += " at " + Number(c.base).toLocaleString("en-US") + " ft";
+      if (c.type) s += " (" + c.type + ")";
+      return s;
+    }).join("; ");
+  }
+
+  const WX = {
+    MI: "shallow", BC: "patches of", PR: "partial", DR: "low drifting", BL: "blowing",
+    SH: "showers of", TS: "thunderstorm with", FZ: "freezing",
+    DZ: "drizzle", RA: "rain", SN: "snow", SG: "snow grains", IC: "ice crystals",
+    PL: "ice pellets", GR: "hail", GS: "small hail", UP: "unknown precipitation",
+    BR: "mist", FG: "fog", FU: "smoke", VA: "volcanic ash", DU: "dust", SA: "sand",
+    HZ: "haze", PY: "spray", PO: "dust whirls", SQ: "squalls", FC: "funnel cloud",
+    SS: "sandstorm", DS: "duststorm"
+  };
+
+  function weather(str) {
+    if (!str) return null;
+    return String(str).split(/\s+/).filter(Boolean).map(function (tok) {
+      let pre = "";
+      if (tok[0] === "-") { pre = "light "; tok = tok.slice(1); }
+      else if (tok[0] === "+") { pre = "heavy "; tok = tok.slice(1); }
+      else if (tok.indexOf("VC") === 0) { pre = "nearby "; tok = tok.slice(2); }
+      const parts = [];
+      for (let i = 0; i < tok.length; i += 2) {
+        const code = tok.substr(i, 2);
+        parts.push(WX[code] || code);
+      }
+      const s = pre + parts.join(" ");
+      return s.charAt(0).toUpperCase() + s.slice(1);
+    }).join(", ");
+  }
+
+  function temp(c) {
+    if (c === undefined || c === null) return null;
+    return c + " °C (" + Math.round(c * 9 / 5 + 32) + " °F)";
+  }
+
+  function pressure(hpa) {
+    if (hpa === undefined || hpa === null) return null;
+    const n = Number(hpa);
+    if (isNaN(n)) return null;
+    return Math.round(n) + " hPa (" + (n / 33.8639).toFixed(2) + " inHg)";
+  }
+
+  function dl(rows) {
+    const d = el("dl", "decoded");
+    rows.forEach(function (r) {
+      if (r[1] === null || r[1] === undefined || r[1] === "") return;
+      d.appendChild(el("dt", null, r[0]));
+      const dd = el("dd");
+      if (r[2]) dd.appendChild(el("span", "chip " + r[2], r[1]));
+      else dd.textContent = r[1];
+      d.appendChild(dd);
+    });
+    return d;
+  }
+
+  function jsonDetails(obj) {
+    const det = el("details");
+    det.appendChild(el("summary", null, "Full JSON"));
+    det.appendChild(el("pre", null, JSON.stringify(obj, null, 2)));
+    return det;
+  }
+
+  /* ---------- METAR block ---------- */
+
+  function metarBlock(items, title) {
+    const wrap = el("div", "part");
+    const h = el("h3", null, title || "METAR");
+    wrap.appendChild(h);
+    if (!items.length) {
+      wrap.appendChild(el("p", "empty", "No METAR available for this airport."));
+      return wrap;
+    }
+    items.forEach(function (m) {
+      const t = fmtTime(m.obsTime || m.reportTime);
+      if (t) h.appendChild(el("span", "time", t));
+      wrap.appendChild(el("pre", null, m.rawOb || "(no raw text in response)"));
+      wrap.appendChild(dl([
+        ["Flight category", m.fltCat, m.fltCat],
+        ["Wind", wind(m)],
+        ["Visibility", visibility(m.visib)],
+        ["Weather", weather(m.wxString)],
+        ["Clouds", clouds(m.clouds)],
+        ["Temperature", temp(m.temp)],
+        ["Dew point", temp(m.dewp)],
+        ["Altimeter", pressure(m.altim)],
+        ["Sea-level pressure", pressure(m.slp)]
+      ]));
+      wrap.appendChild(jsonDetails(m));
+    });
+    return wrap;
+  }
+
+  /* ---------- TAF block ---------- */
+
+  const CHANGE = { FM: "From", BECMG: "Becoming", TEMPO: "Temporarily", PROB: "Probability" };
+
+  function tafBlock(items, title) {
+    const wrap = el("div", "part");
+    const h = el("h3", null, title || "TAF");
+    wrap.appendChild(h);
+    if (!items.length) {
+      wrap.appendChild(el("p", "empty", "No TAF available for this airport."));
+      return wrap;
+    }
+    items.forEach(function (f) {
+      const t = fmtTime(f.issueTime || f.bulletinTime);
+      if (t) h.appendChild(el("span", "time", "issued " + t));
+      wrap.appendChild(el("pre", null, f.rawTAF || "(no raw text in response)"));
+      wrap.appendChild(dl([
+        ["Valid", (fmtTime(f.validTimeFrom) && fmtTime(f.validTimeTo)) ? fmtTime(f.validTimeFrom) + " to " + fmtTime(f.validTimeTo) : null]
+      ]));
+
+      (f.fcsts || []).forEach(function (p) {
+        const period = el("div", "period");
+        let title = p.fcstChange ? (CHANGE[p.fcstChange] || p.fcstChange) : "Base forecast";
+        if (p.probability) title += " " + p.probability + "%";
+        title += ": " + fmtTime(p.timeFrom) + " to " + fmtTime(p.timeTo);
+        if (p.timeBec) title += " (becoming by " + fmtTime(p.timeBec) + ")";
+        period.appendChild(el("h4", null, title));
+
+        let shear = null;
+        if (p.wshearHgt !== undefined && p.wshearHgt !== null) {
+          shear = "At " + Number(p.wshearHgt).toLocaleString("en-US") + " ft, " + (p.wshearDir !== undefined ? p.wshearDir + "° " : "") + (p.wshearSpd !== undefined ? "at " + p.wshearSpd + " kt" : "");
+        }
+        period.appendChild(dl([
+          ["Wind", wind(p)],
+          ["Visibility", visibility(p.visib)],
+          ["Weather", weather(p.wxString)],
+          ["Clouds", clouds(p.clouds)],
+          ["Altimeter", pressure(p.altim)],
+          ["Wind shear", shear]
+        ]));
+        wrap.appendChild(period);
+      });
+
+      wrap.appendChild(jsonDetails(f));
+    });
+    return wrap;
+  }
+
+  /* ---------- map ---------- */
+
+  function mapBlock(lat, lon, label, elev) {
+    const div = el("div", "map");
+    div.setAttribute("role", "img");
+    div.setAttribute("aria-label", "Map showing " + label);
+    return { div: div, init: function () {
+      if (typeof L === "undefined") {
+        div.textContent = "Map could not load (Leaflet library blocked or offline).";
+        div.style.padding = "12px";
+        return;
+      }
+      const map = L.map(div, { scrollWheelZoom: false }).setView([lat, lon], 12);
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+        attribution: "&copy; OpenStreetMap contributors"
+      }).addTo(map);
+      const popup = label + (elev !== undefined && elev !== null ? " &middot; elevation " + Math.round(elev) + " m" : "");
+      L.circleMarker([lat, lon], { radius: 9, weight: 3, color: "#0b6e99", fillColor: "#ffffff", fillOpacity: 0.9 })
+        .addTo(map).bindPopup(popup).openPopup();
+    }};
+  }
+
+  /* ---------- fallback for airports without a METAR ---------- */
+
+  function distKm(lat1, lon1, lat2, lon2) {
+    const R = 6371, rad = Math.PI / 180;
+    const dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  async function loadAirport(id) {
+    const res = await fetch(BASE + "airport?ids=" + encodeURIComponent(id) + "&format=json");
+    if (res.status === 204 || !res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data) && data.length ? data[0] : null;
+  }
+
+  // Closest station that has a current METAR, searching a box around the airport.
+  async function loadNearest(lat, lon) {
+    for (const d of [1, 3]) {
+      const bbox = [lat - d, lon - d, lat + d, lon + d].map(function (x) { return x.toFixed(3); }).join(",");
+      const res = await fetch(BASE + "metar?bbox=" + bbox + "&format=json");
+      if (res.status === 204 || !res.ok) continue;
+      const list = await res.json();
+      let best = null, bestD = Infinity;
+      (Array.isArray(list) ? list : []).forEach(function (m) {
+        if (!m.rawOb || isNaN(Number(m.lat)) || isNaN(Number(m.lon))) return;
+        const k = distKm(lat, lon, Number(m.lat), Number(m.lon));
+        if (k < bestD) { best = m; bestD = k; }
+      });
+      if (best) return { station: best, km: bestD };
+    }
+    return null;
+  }
+
+  // Weather-model estimate for any coordinates (Open-Meteo, no API key).
+  async function loadModel(lat, lon) {
+    const url = "https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon +
+      "&current=temperature_2m,relative_humidity_2m,pressure_msl,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code" +
+      "&wind_speed_unit=kn";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Model data: server returned " + res.status);
+    const data = await res.json();
+    return data.current || null;
+  }
+
+  const WMO = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Freezing fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle", 56: "Light freezing drizzle", 57: "Dense freezing drizzle",
+    61: "Light rain", 63: "Moderate rain", 65: "Heavy rain", 66: "Light freezing rain", 67: "Heavy freezing rain",
+    71: "Light snow", 73: "Moderate snow", 75: "Heavy snow", 77: "Snow grains",
+    80: "Light rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Light snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with light hail", 99: "Thunderstorm with heavy hail"
+  };
+
+  async function findFallback(id) {
+    const fb = {};
+    fb.airport = await loadAirport(id);
+    if (!fb.airport) return fb;
+    const lat = Number(fb.airport.lat), lon = Number(fb.airport.lon);
+    if (isNaN(lat) || isNaN(lon)) return fb;
+
+    const out = await Promise.allSettled([loadNearest(lat, lon), loadModel(lat, lon)]);
+    if (out[0].status === "fulfilled" && out[0].value) {
+      fb.nearest = out[0].value.station;
+      fb.distKm = out[0].value.km;
+      try { fb.nearestTaf = await load("taf", fb.nearest.icaoId); } catch (e) { fb.nearestTaf = []; }
+    }
+    if (out[1].status === "fulfilled") fb.model = out[1].value;
+    return fb;
+  }
+
+  function modelBlock(c) {
+    const wrap = el("div", "part");
+    const h = el("h3", null, "Model estimate at the airport");
+    const t = fmtTime(c.time);
+    if (t) h.appendChild(el("span", "time", t));
+    wrap.appendChild(h);
+    wrap.appendChild(el("p", "note", "Calculated by a weather model (Open-Meteo) for the airport's coordinates. It is an estimate, not an observation."));
+    wrap.appendChild(dl([
+      ["Weather", WMO[c.weather_code]],
+      ["Wind", wind({ wspd: Math.round(c.wind_speed_10m), wdir: Math.round(c.wind_direction_10m), wgst: Math.round(c.wind_gusts_10m) > Math.round(c.wind_speed_10m) ? Math.round(c.wind_gusts_10m) : null })],
+      ["Visibility", c.visibility !== undefined && c.visibility !== null ? visibility(c.visibility / 1609.34) : null],
+      ["Cloud cover", c.cloud_cover !== undefined && c.cloud_cover !== null ? c.cloud_cover + " %" : null],
+      ["Temperature", temp(c.temperature_2m)],
+      ["Humidity", c.relative_humidity_2m !== undefined && c.relative_humidity_2m !== null ? c.relative_humidity_2m + " %" : null],
+      ["Sea-level pressure", pressure(c.pressure_msl)]
+    ]));
+    return wrap;
+  }
+
+  function fallbackBlock(fb) {
+    const wrap = el("div");
+    if (fb.nearest) {
+      const n = fb.nearest;
+      const blk = metarBlock([n], "METAR (nearest station)");
+      const note = el("p", "note", "No METAR is published for this airport. Nearest reporting station: " +
+        n.icaoId + (n.name ? " – " + n.name : "") + ", about " + Math.round(fb.distKm) + " km away.");
+      blk.insertBefore(note, blk.children[1]);
+      wrap.appendChild(blk);
+    } else {
+      const blk = el("div", "part");
+      blk.appendChild(el("h3", null, "METAR"));
+      blk.appendChild(el("p", "empty", "No METAR available for this airport, and no reporting station was found nearby."));
+      wrap.appendChild(blk);
+    }
+    if (fb.model) wrap.appendChild(modelBlock(fb.model));
+    return wrap;
+  }
+
+  /* ---------- render ---------- */
+
+  function render(ids, metars, tafs, fallback) {
+    results.innerHTML = "";
+    const inits = [];
+    ids.forEach(function (id) {
+      const m = metars.filter(function (x) { return x.icaoId === id; });
+      const t = tafs.filter(function (x) { return x.icaoId === id; });
+      const fb = fallback[id] || {};
+      const src = fb.airport || m[0] || t[0] || fb.nearest || {};
+      const name = src.name || "";
+
+      const card = el("section", "card");
+      card.appendChild(el("h2", null, id + (name ? " – " + name : "")));
+
+      const lat = Number(src.lat), lon = Number(src.lon);
+      if (src.lat !== undefined && src.lon !== undefined && !isNaN(lat) && !isNaN(lon)) {
+        const mb = mapBlock(lat, lon, id + (name ? " – " + name : ""), src.elev);
+        card.appendChild(mb.div);
+        inits.push(mb.init);
+      }
+
+      if (m.length) card.appendChild(metarBlock(m));
+      else if (fb.airport) card.appendChild(fallbackBlock(fb));
+      else card.appendChild(metarBlock(m));
+
+      if (t.length) card.appendChild(tafBlock(t));
+      else if (fb.nearestTaf && fb.nearestTaf.length) card.appendChild(tafBlock(fb.nearestTaf, "TAF (nearest station)"));
+      else card.appendChild(tafBlock(t));
+      results.appendChild(card);
+    });
+    // Maps need to be in the DOM before they are created.
+    inits.forEach(function (fn) { fn(); });
+  }
+
+  /* ---------- submit ---------- */
+
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const ids = input.value.toUpperCase().replace(/\s+/g, "").replace(/^,+|,+$/g, "");
+    if (!ids) return;
+    const idList = ids.split(",").filter(Boolean);
+
+    btn.disabled = true;
+    results.innerHTML = "";
+    setStatus("Loading…");
+
+    try {
+      const out = await Promise.allSettled([load("metar", ids), load("taf", ids)]);
+      const metars = out[0].status === "fulfilled" ? out[0].value : [];
+      const tafs = out[1].status === "fulfilled" ? out[1].value : [];
+
+      if (out[0].status === "rejected" && out[1].status === "rejected") {
+        throw out[0].reason;
+      }
+
+      const failed = out.filter(function (o) { return o.status === "rejected"; });
+
+      const have = {};
+      metars.forEach(function (m) { have[m.icaoId] = true; });
+      const missing = idList.filter(function (id) { return !have[id]; });
+
+      const fallback = {};
+      if (missing.length) {
+        setStatus("No METAR for " + missing.join(", ") + ". Looking for nearby weather…");
+        await Promise.all(missing.map(async function (id) {
+          try { fallback[id] = await findFallback(id); } catch (e) { /* ignore */ }
+        }));
+      }
+
+      const anyFallback = Object.keys(fallback).some(function (k) {
+        return fallback[k] && (fallback[k].nearest || fallback[k].model);
+      });
+      if (!metars.length && !tafs.length && !anyFallback) {
+        setStatus("No data found for " + ids + ". Check the code and try again.", true);
+        return;
+      }
+
+      setStatus(failed.length ? failed[0].reason.message : "");
+      render(idList, metars, tafs, fallback);
+    } catch (err) {
+      setStatus("Could not load data: " + err.message + ". If this is a network or CORS error, run the page from a local server or add a small proxy.", true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
